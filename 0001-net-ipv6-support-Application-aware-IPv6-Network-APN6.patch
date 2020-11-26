@@ -1,0 +1,175 @@
+From df7a1b11cbff19c5c86c183af18132d02a512797 Mon Sep 17 00:00:00 2001
+From: Jianwei Mao <mao-linux@maojianwei.com>
+Date: Sun, 19 Apr 2020 09:07:05 +0800
+Subject: [PATCH net-next v2] net: ipv6: support Application-aware IPv6 Network
+ (APN6)
+
+Feature proposal: support Application-aware IPv6 Network (APN6)
+
+This feature allows application client/server set APN6 infos to sockets
+they are using to communicate to each other, by setsockopt().
+
+APN6 infos include three fields now: SLA, AppID and UserID. This APN6
+infos will be encapsulated in IPv6 Hop-by-Hop(HBH) extension header,
+as an APN6 option TLV.
+
+After that, network can provide specific performance for Apps, such as,
+low-lattency for online Games, low-jitter for industrial control,
+enough-bandwidth for video conference/remote medical system, etc.
+
+We made three changes:
+1. add IPV6_APN6 as an optname for IPPROTO_IPV6 level.
+2. add struct apn6_hopopt_hdr to represent APN6 HBH header
+3. add a function to generate IPv6 APN6 HBH header, and re-use
+   IPV6_HOPOPTS procedure to set this header to socket opt.
+
+This feature is to support APN6 IETF Standard draft:
+https://www.ietf.org/id/draft-li-6man-app-aware-ipv6-network-01.txt
+
+Signed-off-by: Jianwei Mao <mao-linux@maojianwei.com>
+---
+ include/uapi/linux/in6.h  |  4 +++
+ include/uapi/linux/ipv6.h | 14 ++++++++
+ net/ipv6/ipv6_sockglue.c  | 68 ++++++++++++++++++++++++++++++---------
+ 3 files changed, 71 insertions(+), 15 deletions(-)
+
+diff --git a/include/uapi/linux/in6.h b/include/uapi/linux/in6.h
+index 9f2273a08356..6601cad58415 100644
+--- a/include/uapi/linux/in6.h
++++ b/include/uapi/linux/in6.h
+@@ -297,4 +297,8 @@ struct in6_flowlabel_req {
+  * ...
+  * MRT6_MAX
+  */
++
++/* APN6: Application-aware IPv6 Network */
++#define IPV6_APN6		81
++
+ #endif /* _UAPI_LINUX_IN6_H */
+diff --git a/include/uapi/linux/ipv6.h b/include/uapi/linux/ipv6.h
+index 13e8751bf24a..0002c1343ab5 100644
+--- a/include/uapi/linux/ipv6.h
++++ b/include/uapi/linux/ipv6.h
+@@ -70,6 +70,20 @@ struct ipv6_opt_hdr {
+ #define ipv6_destopt_hdr ipv6_opt_hdr
+ #define ipv6_hopopt_hdr  ipv6_opt_hdr
+ 
++/* Application-aware IPv6 Network(APN6)
++ * (draft-li-6man-app-aware-ipv6-network, RFC8200)
++ */
++struct apn6_hopopt_hdr {
++	struct ipv6_hopopt_hdr	hopopt_hdr;
++	__u8 		opt_type;
++	__u8 		opt_len;
++
++	__be32 		sla;
++	__be32 		app_id;
++	__be32 		user_id;
++};
++#define IPV6_HOPOPT_TYPE_APN6	3
++
+ /* Router Alert option values (RFC2711) */
+ #define IPV6_OPT_ROUTERALERT_MLD	0x0000	/* MLD(RFC2710) */
+ 
+diff --git a/net/ipv6/ipv6_sockglue.c b/net/ipv6/ipv6_sockglue.c
+index debdaeba5d8c..6049f0e2e6d4 100644
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@ -136,6 +136,31 @@ static bool setsockopt_needs_rtnl(int optname)
+ 	return false;
+ }
+ 
++/* Return APN6 Hop-by-Hop(HBH) extension header */
++static void *generate_apn6_hopopts(char __user *optval, unsigned int optlen)
++{
++	struct apn6_hopopt_hdr *apn6_hbh;
++	unsigned int sla, app_id, user_id;
++
++	if (optlen < (sizeof(unsigned int) * 3) || !optval)
++		return NULL;
++
++	if (get_user(sla, ((unsigned int __user *)optval)) ||
++	    get_user(app_id, ((unsigned int __user *)optval) + 1) ||
++	    get_user(user_id, ((unsigned int __user *)optval) + 2))
++		return ERR_PTR(-EFAULT);
++
++	apn6_hbh = kzalloc(sizeof(*apn6_hbh), GFP_KERNEL);
++	apn6_hbh->hopopt_hdr.hdrlen = (sizeof(*apn6_hbh) >> 3) - 1;
++	apn6_hbh->opt_type = IPV6_HOPOPT_TYPE_APN6;
++	apn6_hbh->opt_len = sizeof(*apn6_hbh) - 4;
++	apn6_hbh->sla = htonl(sla);
++	apn6_hbh->app_id = htonl(app_id);
++	apn6_hbh->user_id = htonl(user_id);
++
++	return apn6_hbh;
++}
++
+ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
+ 		    char __user *optval, unsigned int optlen)
+ {
+@@ -400,34 +425,47 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
+ 	case IPV6_RTHDRDSTOPTS:
+ 	case IPV6_RTHDR:
+ 	case IPV6_DSTOPTS:
++	case IPV6_APN6:
+ 	{
+ 		struct ipv6_txoptions *opt;
+ 		struct ipv6_opt_hdr *new = NULL;
+ 
+ 		/* hop-by-hop / destination options are privileged option */
+ 		retv = -EPERM;
+-		if (optname != IPV6_RTHDR && !ns_capable(net->user_ns, CAP_NET_RAW))
++		if (optname != IPV6_APN6 && optname != IPV6_RTHDR &&
++		    !ns_capable(net->user_ns, CAP_NET_RAW))
+ 			break;
+ 
+-		/* remove any sticky options header with a zero option
+-		 * length, per RFC3542.
+-		 */
+-		if (optlen == 0)
+-			optval = NULL;
+-		else if (!optval)
+-			goto e_inval;
+-		else if (optlen < sizeof(struct ipv6_opt_hdr) ||
+-			 optlen & 0x7 || optlen > 8 * 255)
+-			goto e_inval;
+-		else {
+-			new = memdup_user(optval, optlen);
++		if (optname == IPV6_APN6) {
++			new = generate_apn6_hopopts(optval, optlen);
+ 			if (IS_ERR(new)) {
+ 				retv = PTR_ERR(new);
+ 				break;
+ 			}
+-			if (unlikely(ipv6_optlen(new) > optlen)) {
+-				kfree(new);
++			// next steps are same as IPV6_HOPOPTS procedure,
++			// so we reuse it.
++			optname = IPV6_HOPOPTS;
++		} else {
++			/* remove any sticky options header with a zero option
++			 * length, per RFC3542.
++			 */
++			if (optlen == 0)
++				optval = NULL;
++			else if (!optval)
++				goto e_inval;
++			else if (optlen < sizeof(struct ipv6_opt_hdr) ||
++				     optlen & 0x7 || optlen > 8 * 255)
+ 				goto e_inval;
++			else {
++				new = memdup_user(optval, optlen);
++				if (IS_ERR(new)) {
++					retv = PTR_ERR(new);
++					break;
++				}
++				if (unlikely(ipv6_optlen(new) > optlen)) {
++					kfree(new);
++					goto e_inval;
++				}
+ 			}
+ 		}
+ 
+-- 
+2.17.1
+
